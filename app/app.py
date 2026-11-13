@@ -5,9 +5,15 @@
 下载全库 CSV 使用受理时刻的文件快照，旧文件等下载结束后回收；
 崩溃重启后未切换的合并保留旧数据并清理残件，已切换的接续回收。
 
+下载收尾（释放引用 + 回收旧文件）在受限后台线程池中执行：
+请求线程只投递任务，不为等待目录库写锁而占用；目录库被其他连接长时间
+持锁时任务退避重试，解锁后自动补完，不丢失、不需要重启或再次下载。
+
 所有读写路径都按批流式处理，内存占用不随总行数增长。
 """
 
+import atexit
+import concurrent.futures
 import csv
 import io
 import json
@@ -36,6 +42,12 @@ PROGRESS_INTERVAL = 0.5                 # 合并进度落库节流（秒）
 # 演示/测试钩子：每处理一批人为延时（毫秒），便于观察进度、慢下载、崩溃恢复
 MERGE_BATCH_DELAY_MS = int(os.environ.get("MERGE_BATCH_DELAY_MS", "0"))
 DOWNLOAD_BATCH_DELAY_MS = int(os.environ.get("DOWNLOAD_BATCH_DELAY_MS", "0"))
+# 目录库写事务的忙等上限（毫秒）：单次等待超过即报 database is locked，
+# 由后台收尾任务退避重试兜底（见 _retry_on_lock）
+DB_BUSY_TIMEOUT_MS = int(os.environ.get("DB_BUSY_TIMEOUT_MS", "30000"))
+# 下载收尾后台线程数上限：等待写锁的释放任务不会占满服务请求线程
+RELEASE_WORKERS = int(os.environ.get("RELEASE_WORKERS", "4"))
+RELEASE_RETRY_MAX_DELAY = 2.0           # 收尾遇锁重试的退避上限（秒）
 
 SCHEMA = pa.schema([
     ("site", pa.string()),
@@ -61,19 +73,43 @@ app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024  # 4 GiB
 merge_lock = threading.Lock()   # 同时只执行一次合并
 reap_lock = threading.Lock()
 
+# 下载收尾（释放引用 + 回收退役文件）专用后台线程池，线程数有上限：
+# 请求线程只投递任务立刻返回，等待目录库写锁发生在这里，不占满服务线程。
+release_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=RELEASE_WORKERS, thread_name_prefix="release"
+)
+_stop = threading.Event()       # 进程退出时让重试循环尽快收尾
+atexit.register(_stop.set)
+
+_release_stat_lock = threading.Lock()
+_release_pending = 0            # 已投递、未开始的收尾任务数
+_release_active = 0             # 执行中的收尾任务数（<= RELEASE_WORKERS）
+
+
+def release_stats():
+    with _release_stat_lock:
+        return {
+            "workers": RELEASE_WORKERS,
+            "pending": _release_pending,
+            "active": _release_active,
+        }
+
+
 # ---------------------------------------------------------------- 目录库
 
 
 def db():
-    con = sqlite3.connect(DB_PATH, timeout=30)
+    con = sqlite3.connect(DB_PATH, timeout=DB_BUSY_TIMEOUT_MS / 1000)
     con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA busy_timeout=30000")
+    # journal_mode 只在 init_db 里切换一次：日常连接不再触碰日志模式，
+    # 其他连接持有写锁时只读请求（状态页/健康检查）仍可立即响应。
+    con.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
     return con
 
 
 def init_db():
     con = db()
+    con.execute("PRAGMA journal_mode=WAL")
     con.executescript(
         """
         CREATE TABLE IF NOT EXISTS files (
@@ -128,9 +164,12 @@ def fsync_dir(path):
 # ---------------------------------------------------------------- 回收
 
 
-def reap_retired():
-    """删除 refs=0 的退役文件（旧文件保留到相关下载结束后再回收）。"""
-    if not reap_lock.acquire(blocking=False):
+def reap_retired(blocking=False):
+    """删除 refs=0 的退役文件（旧文件保留到相关下载结束后再回收）。
+
+    幂等：文件已删或目录行已删都会跳过，可在锁冲突后安全重试。
+    """
+    if not reap_lock.acquire(blocking=blocking):
         return
     try:
         con = db()
@@ -346,10 +385,37 @@ def run_merge(merge_id, inputs, out_name):
         merge_lock.release()
 
 
-# ---------------------------------------------------------------- 下载引用计数
+# ---------------------------------------------------------------- 下载收尾
+#
+# 下载结束或断开后必须释放本次引用并让旧文件得以回收。目录库可能被另一
+# 连接长时间持写锁（> busy_timeout），因此：
+#   - 请求线程只投递任务，不在原地等待写锁（不占满服务请求线程）；
+#   - 后台线程池有上限，任务遇锁退避重试，解锁后自动补完，不丢失；
+#   - 进程退出时未完成的任务由重启回收兜底（file_refs 重启清零）。
 
 
-def release_refs(ids):
+def _is_lock_error(exc):
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
+def _retry_on_lock(fn, what):
+    """遇目录库写锁冲突就退避重试，直到完成或进程退出；其它异常直接抛出。"""
+    delay = 0.1
+    while not _stop.is_set():
+        try:
+            fn()
+            return
+        except sqlite3.OperationalError as e:
+            if not _is_lock_error(e):
+                raise
+            app.logger.warning("%s：目录库写锁被占用，稍后重试（%s）", what, e)
+            _stop.wait(delay)
+            delay = min(delay * 2, RELEASE_RETRY_MAX_DELAY)
+
+
+def _decrement_refs(ids):
+    """只减本次下载自己的引用（短写事务）；失败回滚，可整体重试。"""
     con = db()
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -361,7 +427,38 @@ def release_refs(ids):
         con.commit()
     finally:
         con.close()
-    reap_retired()
+
+
+def _release_entry(ids):
+    global _release_pending, _release_active
+    with _release_stat_lock:
+        _release_pending -= 1
+        _release_active += 1
+    try:
+        _retry_on_lock(lambda: _decrement_refs(ids), f"释放下载引用 {list(ids)}")
+        # 引用释放后顺手回收无读者的旧文件；回收幂等，失败还有周期回收兜底
+        _retry_on_lock(lambda: reap_retired(blocking=True), "回收无读者旧文件")
+    except Exception:
+        app.logger.exception("下载收尾失败（重启时会兜底回收）")
+    finally:
+        with _release_stat_lock:
+            _release_active -= 1
+
+
+def submit_release(ids):
+    """下载结束/断开时调用：只投递后台任务，请求线程不等目录库写锁。"""
+    global _release_pending
+    ids = tuple(ids)
+    if not ids:
+        return
+    with _release_stat_lock:
+        _release_pending += 1
+    try:
+        release_executor.submit(_release_entry, ids)
+    except RuntimeError:  # 解释器退出中无法投递，交由重启回收兜底
+        with _release_stat_lock:
+            _release_pending -= 1
+        app.logger.warning("进程退出中，释放任务转交重启回收处理")
 
 
 # ---------------------------------------------------------------- 路由
@@ -442,8 +539,9 @@ def download():
             if buf.tell():
                 yield buf.getvalue()
         finally:
-            # 正常结束或客户端断开（GeneratorExit）都会释放引用
-            release_refs([fid for fid, _ in snapshot])
+            # 正常结束或客户端断开（GeneratorExit）都会触发收尾；
+            # 只投递后台任务，请求线程不为等待目录库写锁而占用
+            submit_release(fid for fid, _ in snapshot)
 
     return Response(
         generate(),
@@ -515,7 +613,8 @@ def api_status():
         ).fetchone()
     finally:
         con.close()
-    payload = {"files": agg["c"], "rows": agg["s"], "merge": None}
+    payload = {"files": agg["c"], "rows": agg["s"], "merge": None,
+               "release": release_stats()}
     if m:
         payload["merge"] = {
             "id": m["id"],
@@ -576,6 +675,7 @@ TEMPLATE = """<!doctype html>
   <div id="mergeInfo" class="muted">暂无合并任务</div>
   <div class="bar"><div id="mergeBar"></div></div>
   <div id="mergeErr" class="err"></div>
+  <div id="releaseInfo" class="muted"></div>
 </div>
 
 <form method="post" action="{{ url_for('merge') }}">
@@ -635,6 +735,12 @@ async function poll(){
       info.textContent = '暂无合并任务';
       btn.disabled = false;
     }
+    const rel = j.release;
+    document.getElementById('releaseInfo').textContent =
+      (rel && (rel.pending + rel.active) > 0)
+        ? '后台释放下载引用中：排队 ' + rel.pending + '，执行 ' + rel.active +
+          '（线程上限 ' + rel.workers + '）；若目录库写锁被占用会自动重试'
+        : '';
   }catch(e){}
   setTimeout(poll, 1200);
 }
